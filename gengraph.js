@@ -14,6 +14,7 @@ program
   .requiredOption('-p, --path <path>', 'JS/TS file or directory to analyze')
   .option('-e, --external-dependencies', 'Include external dependencies in the result')
   .option('-o, --output-file <file>', 'Write output to the specified file', 'output/context.json')
+  .option('-c, --include-function-code', 'Include source code for each function in output')
   .option('--verbosity <level>', 'Verbosity level: quiet | info | debug', 'info')
   .option('-x, --exclude <dirs...>', 'Directories to exclude from scanning', (value, prev) => prev.concat(value), [])
   .version('1.0.0')
@@ -23,6 +24,7 @@ const options = program.opts();
 const inputPath = options.path;
 const verbosity = options.verbosity;
 const includeExternal = options.externalDependencies;
+const includeCode = options.includeFunctionCode;
 const outputFile = options.outputFile;
 const excludeDirs = new Set(['node_modules', 'dist', 'public', ...(options.exclude || [])]);
 
@@ -63,8 +65,8 @@ function findJsxFiles(dirPath) {
   return result;
 }
 
-const importSymbolToSourceMap = new Map();           // alias → source file
-const fileToDeclaredSymbols = new Map();             // source file → Set of declared function names
+const importSymbolToSourceMap = new Map();
+const fileToDeclaredSymbols = new Map();
 
 function analyzeFile(filePath) {
   const code = fs.readFileSync(filePath, 'utf-8');
@@ -279,38 +281,39 @@ function analyzeFile(filePath) {
   const result = [];
   implemented.forEach(fn => {
     const deps = resolveDependencies(fn);
-    let rawCode = '/* implementation not found */';
-
-    traverse(ast, {
-      enter(path) {
-        const node = path.node;
-        let name = null;
-
-        if (path.isFunctionDeclaration() && node.id?.name === fn) name = node.id.name;
-        else if (
-          path.isVariableDeclarator() &&
-          node.id?.name === fn &&
-          (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
-        ) name = node.id.name;
-        else if (path.isClassDeclaration() && node.id?.name === fn) name = node.id.name;
-
-        if (name === fn) {
-          rawCode = code.slice(node.start, node.end);
-          path.stop();
-        }
-      }
-    });
-
     const output = {
       file: path.resolve(filePath),
       function: fn,
-      dependencies: deps.dependencies,
-      code: rawCode,
-      fileContent: code
+      dependencies: deps.dependencies
     };
 
     if (includeExternal && deps.dependenciesExternal?.length) {
       output.dependenciesExternal = deps.dependenciesExternal;
+    }
+
+    if (includeCode) {
+      let rawCode = '/* implementation not found */';
+      traverse(ast, {
+        enter(path) {
+          const node = path.node;
+          let name = null;
+
+          if (path.isFunctionDeclaration() && node.id?.name === fn) name = node.id.name;
+          else if (
+            path.isVariableDeclarator() &&
+            node.id?.name === fn &&
+            (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
+          ) name = node.id.name;
+          else if (path.isClassDeclaration() && node.id?.name === fn) name = node.id.name;
+
+          if (name === fn) {
+            rawCode = code.slice(node.start, node.end);
+            path.stop();
+          }
+        }
+      });
+
+      output.code = rawCode;
     }
 
     result.push(output);
@@ -320,21 +323,36 @@ function analyzeFile(filePath) {
 }
 
 const allFiles = findJsxFiles(inputPath);
-let finalResults = [];
+let nodes = [];
+const fileContentMap = new Map();
 
 for (const file of allFiles) {
   log(`Analyzing ${file}`);
   try {
     const res = analyzeFile(file);
-    finalResults.push(...res);
+    nodes.push(...res);
+
+    const fullPath = path.resolve(file);
+    if (!fileContentMap.has(fullPath)) {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      fileContentMap.set(fullPath, {
+        path: fullPath,
+        content
+      });
+    }
   } catch (err) {
     console.error(`Error analyzing ${file}:`, err.message);
   }
 }
 
+const result = {
+  nodes,
+  filesContent: Array.from(fileContentMap.values())
+};
+
 const resolvedOutputPath = path.resolve(outputFile);
 fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
-fs.writeFileSync(resolvedOutputPath, JSON.stringify(finalResults, null, 2), 'utf-8');
+fs.writeFileSync(resolvedOutputPath, JSON.stringify(result, null, 2), 'utf-8');
 
 if (VERBOSE >= 1) {
   console.log(`Output written to ${resolvedOutputPath}`);

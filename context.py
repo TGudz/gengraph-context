@@ -8,23 +8,21 @@ from dotenv import load_dotenv
 
 class ArgsParser:
     def __init__(self):
-        self.parser = argparse.ArgumentParser(description="JSX Dependency Graph Tool")
+        self.parser = argparse.ArgumentParser(description="JS/TS Dependency Graph Tool")
         subparsers = self.parser.add_subparsers(dest="command")
 
         upload_parser = subparsers.add_parser("upload", help="Upload dependency graph to Neo4j")
-        upload_parser.add_argument("-f", "--full-context-file", default="output/context.json", help="Path to deps.json file")
-        upload_parser.add_argument("-r", "--run-analyzer", action="store_true", help="Run JS analyzer to generate deps.json")
-        upload_parser.add_argument("-p", "--path", help="Path to JSX project (used with --run-analyzer)")
+        upload_parser.add_argument("-f", "--full-context-file", default="output/context.json", help="Path to context.json file")
+        upload_parser.add_argument("-r", "--run-analyzer", action="store_true", help="Run JS analyzer to generate context.json")
+        upload_parser.add_argument("-p", "--path", help="Path to source project for --run-analyzer")
 
         context_parser = subparsers.add_parser("get-context", help="Get dependency context for a function")
         context_parser.add_argument("-n", "--function-name", required=True, help="Function/component name")
-        context_parser.add_argument("-d", "--depth", default="-1:-1", help="Depth as PARENTS:CHILDREN (default -1:0)")
-        
-        output_group = context_parser.add_mutually_exclusive_group()
-        output_group.add_argument("-F", "--output-filenames-only", action="store_true", help="Print only the filenames (no code or metadata)")
-        output_group.add_argument("-c", "--file-content", action="store_true", help="Print full file content for each function")
-        
-        context_parser.add_argument("-o", "--output-file", default="output/context.txt", help="Output file path (default: output/context.txt)")
+        context_parser.add_argument("-d", "--depth", default="*:*", help="Depth as PARENTS:CHILDREN (default *:*)")
+        context_parser.add_argument("-f", "--full-context-file", default="output/context.json", help="Path to context.json")
+        context_parser.add_argument("-o", "--output-file", default="output/context.txt", help="Write output to this file")
+        context_parser.add_argument("-c", "--include-function-code", action="store_true", help="Include function code if available")
+        context_parser.add_argument("-C", "--no-files-content", action="store_true", help="Exclude file contents from output")
 
     def parse(self):
         return self.parser.parse_args()
@@ -35,13 +33,14 @@ def load_dependencies(json_file):
         return json.load(f)
 
 
-def push_to_neo4j(data, uri, user, password):
+def push_to_neo4j(context, uri, user, password):
+    nodes = context.get("nodes", [])
     driver = GraphDatabase.driver(uri, auth=(user, password))
     with driver.session() as session:
         session.execute_write(clear_graph)
 
         function_index = {}
-        for item in data:
+        for item in nodes:
             file = item['file']
             func = item['function']
             full_func = f"{file}::{func}"
@@ -50,11 +49,10 @@ def push_to_neo4j(data, uri, user, password):
                 'label': func,
                 'group': os.path.dirname(file),
                 'file': file,
-                'code': item.get('code', ''),
-                'fileContent': item.get('fileContent', '')
+                'code': item.get('code', '')
             }
 
-        for item in data:
+        for item in nodes:
             func_entry = function_index[item['function']]
             session.execute_write(create_node, **func_entry)
 
@@ -65,13 +63,12 @@ def push_to_neo4j(data, uri, user, password):
                     session.execute_write(create_edge, func_entry['id'], dep_entry['id'])
                 else:
                     unresolved_id = f"unknown::{dep}"
-                    session.execute_write(create_node, unresolved_id, dep, 'unknown', '', '', '')
+                    session.execute_write(create_node, unresolved_id, dep, 'unknown', '', '')
                     session.execute_write(create_edge, func_entry['id'], unresolved_id)
 
             for ext in item.get("dependenciesExternal", []):
-                session.execute_write(create_node, ext, ext, 'external', '', '', '')
+                session.execute_write(create_node, ext, ext, 'external', '', '')
                 session.execute_write(create_edge, func_entry['id'], ext)
-
     driver.close()
 
 
@@ -79,17 +76,10 @@ def clear_graph(tx):
     tx.run("MATCH (n) DETACH DELETE n")
 
 
-def create_node(tx, id, label, group, file, code, fileContent):
+def create_node(tx, id, label, group, file, code):
     tx.run(
-        """
-        MERGE (n:Node {id: $id})
-        SET n.label = $label,
-            n.group = $group,
-            n.file = $file,
-            n.code = $code,
-            n.fileContent = $fileContent
-        """,
-        id=id, label=label, group=group, file=file, code=code, fileContent=fileContent
+        "MERGE (n:Node {id: $id}) SET n.label = $label, n.group = $group, n.file = $file, n.code = $code",
+        id=id, label=label, group=group, file=file, code=code
     )
 
 
@@ -102,148 +92,153 @@ def create_edge(tx, src_id, dst_id):
 
 def depth2neo4j(depth_range: str, direction: str) -> str:
     try:
-        start, end = map(int, depth_range.split(":"))
-        if direction == "parent":
-            return "0.." if start == -1 else f"0..{start}"
-        elif direction == "child":
-            return "1.." if end == -1 else f"1..{end}"
-        return ""
+        up_raw, down_raw = (depth_range.split(":") + [""])[:2]
     except ValueError:
-        print("❌ Error: Invalid depth format. Please use the format 'PARENTS:CHILDREN' (e.g. '-1:-1' or '2:1')")
-        print("   Note: When using negative numbers, wrap the entire argument in quotes:")
-        print("   Example: -d \"-1:-1\"")
-        exit(1)
+        raise ValueError("Invalid depth format. Use format like '*:*', '2:3', '*:0', etc.")
+
+    if direction == "parent":
+        if up_raw.strip() == "*" or up_raw == "":
+            return "0.."
+        elif up_raw.isdigit():
+            return f"0..{up_raw}"
+        else:
+            raise ValueError("Invalid parent depth")
+    elif direction == "child":
+        if down_raw.strip() == "*" or down_raw == "":
+            return "1.."
+        elif down_raw == "0":
+            return ""
+        elif down_raw.isdigit():
+            return f"1..{down_raw}"
+        else:
+            raise ValueError("Invalid child depth")
+    return ""
 
 
-def get_context(function_name, uri, user, password, depth, filenames_only=False, file_content=False, output_file=None):
+def get_context(function_name, uri, user, password, depth, context_file, output_file, include_code, skip_files_content):
+    context_data = load_dependencies(context_file)
+    files_map = {entry["path"]: entry["content"] for entry in context_data.get("filesContent", [])}
+
     parent_range = depth2neo4j(depth, "parent")
     child_range = depth2neo4j(depth, "child")
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    parents = []
+    children = []
+    files_in_context = set()
+    target_info = None
+
     with driver.session() as session:
-        query = f"""
+
+        # Parent query
+        parent_query = f"""
         MATCH (target:Node {{label: $name}})
-        OPTIONAL MATCH path1 = (target)<-[:DEPENDS_ON*{parent_range}]-(parent)
-        OPTIONAL MATCH path2 = (target)-[:DEPENDS_ON*{child_range}]->(child)
-        WITH target, 
-             CASE WHEN parent IS NULL THEN [] ELSE [parent] END AS parent_list,
-             CASE WHEN child IS NULL THEN [] ELSE [child] END AS child_list
-        WITH target,
-             [x IN parent_list WHERE x IS NOT NULL | x] AS parents,
-             [x IN child_list WHERE x IS NOT NULL | x] AS children
-        RETURN target, parents, children
+        OPTIONAL MATCH path = (target)<-[:DEPENDS_ON*{parent_range}]-(p)
+        WITH collect(nodes(path)) AS nodes, target
+        UNWIND nodes AS n
+        UNWIND n AS x
+        RETURN DISTINCT x.label AS label, x.file AS file, x.code AS code, target.label AS targetLabel
         """
-        result = session.run(query, name=function_name)
+        parent_result = session.run(parent_query, name=function_name)
+        for record in parent_result:
+            label = record["label"]
+            file = record["file"]
+            code = record.get("code", "")
+            files_in_context.add(file)
+            if label == function_name:
+                target_info = f"\n🎯 Component/Function of interest: {function_name}\n\tFile: {file}"
+                if include_code and code:
+                    target_info += f"\nCode:\n{code}"
+                continue
+            block = f"\n🔹 {label}\n\tFile: {file}"
+            if include_code and code:
+                block += f"\n\tCode:\n{code}"
+            parents.append(block)
 
-        records = list(result)
-        if not records:
-            message = f"❌ No function named '{function_name}' found."
-            if output_file:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.write(message)
-            else:
-                print(message)
-            return
+        # Child query
+        if child_range:
+            child_query = f"""
+            MATCH (target:Node {{label: $name}})
+            OPTIONAL MATCH path2 = (target)-[:DEPENDS_ON*{child_range}]->(c)
+            WITH collect(nodes(path2)) AS nodes, target
+            UNWIND nodes AS n
+            UNWIND n AS x
+            RETURN DISTINCT x.label AS label, x.file AS file, x.code AS code
+            """
+            child_result = session.run(child_query, name=function_name)
+            for record in child_result:
+                label = record["label"]
+                file = record["file"]
+                code = record.get("code", "")
+                files_in_context.add(file)
+                if label == function_name:
+                    continue
+                block = f"\n🔹 {label}\n\tFile: {file}"
+                if include_code and code:
+                    block += f"\n\tCode:\n{code}"
+                children.append(block)
 
-        output = []
-        for i, record in enumerate(records):
-            target = record["target"]
-            parents = record["parents"]
-            children = record["children"]
+    out = []
+    if target_info:
+        out.append(target_info)
+    else:
+        out.append(f"\n🎯 Component/Function '{function_name}' not found in graph.")
 
-            if i > 0:
-                output.append("\n" + "=" * 80 + "\n")  # Separator between multiple functions
+    out.append("\n⬆️  Parent (calling) components/functions:")
+    out.append("None" if not parents else "\n".join(parents))
 
-            output.append(f"\n🔹 {target['label']} function:")
-            output.append(f"File: {target.get('file') or '<no file>'}")
-            if file_content:
-                output.append("File Content:\n" + (target.get('fileContent') or "<no content>"))
-            else:
-                output.append("Code:\n" + (target.get('code') or "<no code>"))
-            output.append("-" * 80 + "\n")
-            if filenames_only:
-                if parents:
-                    output.append("\nParent (calling) functions:")
-                    for p in sorted(parents, key=lambda x: x['label']):
-                        output.append(f"🔹 {p['label']}\n  {p.get('file') or '<no file>'}")
+    out.append("\n⬇️  Children (called) components/functions:")
+    out.append("None" if not children else "\n".join(children))
 
-                if children:
-                    output.append("\nChildren (called) functions:")
-                    for c in sorted(children, key=lambda x: x['label']):
-                        output.append(f"🔹 {c['label']}\n  {c.get('file') or '<no file>'}")
-            else:
-                output.append("\nParent (calling) functions:")
-                if parents:
-                    for p in sorted(parents, key=lambda x: x['label']):
-                        output.append(f"\n🔹 {p['label']}")
-                        output.append(f"File: {p.get('file') or '<no file>'}")
-                        if file_content:
-                            output.append("File Content:\n" + (p.get('fileContent') or "<no content>"))
-                        else: 
-                            output.append("Code:\n" + (p.get('code') or "<no code>"))
-                        output.append("-" * 80 + "\n")
-                else:
-                    output.append("  (none)")
+    if not skip_files_content:
+        out.append("\n📄 Included File Contents:")
+        for file in sorted(files_in_context):
+            content = files_map.get(file, None)
+            if content:
+                out.append(f"\n--- {file} ---\n{content}\n")
 
-                output.append("\nChildren (called) functions:")
-                if children:
-                    for c in sorted(children, key=lambda x: x['label']):
-                        output.append(f"\n🔹 {c['label']}")
-                        output.append(f"File: {c.get('file') or '<no file>'}")
-                        if file_content:
-                            output.append("File Content:\n" + (c.get('fileContent') or "<no content>"))
-                        else:
-                            output.append("Code:\n" + (c.get('code') or "<no code>"))
-                        output.append("-" * 80 + "\n")
-                else:
-                    output.append("  (none)")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
 
-        output_text = "\n".join(output)
-        if output_file:
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(output_text)
-        else:
-            print(output_text)
-
+    print(f"✅ Context saved to {output_file}")
     driver.close()
 
 
 def main():
     load_dotenv()
-
     args = ArgsParser().parse()
+
     uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "test1234")
 
     if args.command == "upload":
-        full_context_file = args.full_context_file
         if args.run_analyzer:
             if not args.path:
-                print("❌ --path is required when using --run-js-analyzer")
+                print("❌ --path is required when using --run-analyzer")
                 return
+            full_context_file = args.full_context_file
             print("⚙️ Running JS analyzer...")
             subprocess.run(["node", "./gengraph.js", "-p", args.path, "-o", full_context_file], check=True)
-
-        data = load_dependencies(full_context_file)
-        push_to_neo4j(data, uri, user, password)
+        context = load_dependencies(args.full_context_file)
+        push_to_neo4j(context, uri, user, password)
         print("✅ Graph imported to Neo4j with full function metadata.")
 
     elif args.command == "get-context":
-        try:
-            get_context(args.function_name, uri, user, password, args.depth, 
-                       filenames_only=args.output_filenames_only,
-                       file_content=args.file_content,
-                       output_file=args.output_file)
-        except ValueError as e:
-            if "depth" in str(e).lower():
-                print("❌ Error: Invalid depth format. Please use the format 'PARENTS:CHILDREN' (e.g. '-1:-1' or '2:1')")
-                print("   Note: When using negative numbers, wrap the entire argument in quotes:")
-                print("   Example: -d \"-1:-1\"")
-            else:
-                print(f"❌ Error: {str(e)}")
-
+        depth = args.depth if ':' in args.depth else f"{args.depth}:{args.depth}"
+        get_context(
+            args.function_name,
+            uri,
+            user,
+            password,
+            depth,
+            args.full_context_file,
+            args.output_file,
+            args.include_function_code,
+            args.no_files_content
+        )
     else:
         print("❌ Unknown command. Use --help for guidance.")
 
